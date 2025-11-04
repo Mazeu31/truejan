@@ -1,14 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# Troja n autoscript for Debian
+# Trojan Debian Auto Installer (APT primary)
 # - standard config dir: /usr/local/etc/trojan
 # - port: 2443
+# - tries `apt install trojan -y` first, falls back to release download
 # - creates /usr/local/bin/trojan-menu and sudoers NOPASSWD entry
 # - edits config safely using python3 json
 
 TROJAN_PORT=2443
-TROJAN_BIN="/usr/local/bin/trojan"
+TROJAN_BIN_CANDIDATES=("/usr/bin/trojan" "/usr/local/bin/trojan" "/bin/trojan")
+TROJAN_BIN=""
 TROJAN_DIR="/usr/local/etc/trojan"
 CONFIG_FILE="$TROJAN_DIR/config.json"
 SERVICE_FILE="/etc/systemd/system/trojan.service"
@@ -22,67 +24,88 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-echo -e "${CYAN}${BOLD}=== Trojan Debian Auto Installer ===${RESET}"
+echo -e "${CYAN}${BOLD}=== Trojan Debian Auto Installer (APT primary) ===${RESET}"
 echo
 
-# Install packages
-echo -e "${YELLOW}Installing packages...${RESET}"
+# Install base packages
+echo -e "${YELLOW}Installing base packages...${RESET}"
 apt update -y
 apt install -y wget curl xz-utils tar ca-certificates openssl python3 python3-pip ufw qrencode sudo || true
 
-# Create needed dirs
 mkdir -p "$TROJAN_DIR"
 chmod 755 "$TROJAN_DIR"
 
-# Fetch latest trojan linux-amd64 release (with retries)
-echo -e "${YELLOW}Downloading latest Trojan release...${RESET}"
-attempt=0
-max_attempts=4
-tmpfile="/tmp/trojan.tar.xz"
-rm -f "$tmpfile"
-while [ $attempt -lt $max_attempts ]; do
-  attempt=$((attempt+1))
-  echo "  try #$attempt..."
-  LATEST_URL=$(curl -s https://api.github.com/repos/trojan-gfw/trojan/releases/latest \
-    | grep browser_download_url \
-    | grep linux-amd64 \
-    | cut -d '"' -f 4 || true)
-  if [ -z "$LATEST_URL" ]; then
-    echo "  Could not find release URL (API may be rate-limited). Retrying..."
+# Attempt to install trojan via apt first
+echo -e "${YELLOW}Attempting to install 'trojan' package via apt...${RESET}"
+if apt-get -qq install -y trojan >/dev/null 2>&1; then
+  echo -e "${GREEN}Installed 'trojan' package via apt.${RESET}"
+else
+  echo -e "${YELLOW}Package 'trojan' not available via apt or install failed. Will fallback to release download.${RESET}"
+fi
+
+# Locate trojan binary from known locations or PATH
+for candidate in "${TROJAN_BIN_CANDIDATES[@]}"; do
+  if [ -x "$candidate" ]; then
+    TROJAN_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$TROJAN_BIN" ]; then
+  # try which
+  if command -v trojan >/dev/null 2>&1; then
+    TROJAN_BIN="$(command -v trojan)"
+  fi
+fi
+
+# Fallback: download latest release if binary not found
+if [ -z "$TROJAN_BIN" ]; then
+  echo -e "${YELLOW}Trojan binary not found after apt attempt. Downloading latest release...${RESET}"
+  tmpfile="/tmp/trojan.tar.xz"
+  attempt=0
+  max_attempts=4
+  rm -f "$tmpfile"
+  while [ $attempt -lt $max_attempts ]; do
+    attempt=$((attempt+1))
+    echo "  try #$attempt..."
+    LATEST_URL=$(curl -s https://api.github.com/repos/trojan-gfw/trojan/releases/latest \
+      | grep browser_download_url \
+      | grep linux-amd64 \
+      | cut -d '"' -f 4 || true)
+    if [ -z "$LATEST_URL" ]; then
+      echo "  Could not find release URL (API may be rate-limited). Retrying..."
+      sleep 2
+      continue
+    fi
+    curl -fsSL "$LATEST_URL" -o "$tmpfile" && break
+    echo "  download failed or archive corrupt; retrying..."
+    rm -f "$tmpfile"
     sleep 2
-    continue
+  done
+
+  if [ ! -f "$tmpfile" ]; then
+    echo -e "${RED}Failed to download trojan release after $max_attempts attempts.${RESET}"
+    exit 1
   fi
 
-  # Use curl -L to follow redirects
-  curl -fsSL "$LATEST_URL" -o "$tmpfile" && break
-  echo "  download failed or archive corrupt; retrying..."
-  rm -f "$tmpfile"
-  sleep 2
-done
-
-if [ ! -f "$tmpfile" ]; then
-  echo -e "${RED}Failed to download trojan release after $max_attempts attempts.${RESET}"
-  exit 1
-fi
-
-# Extract and install binary
-echo -e "${YELLOW}Extracting trojan binary...${RESET}"
-# create temp dir
-TMPDIR=$(mktemp -d)
-tar -xJf "$tmpfile" -C "$TMPDIR"
-if [ ! -f "$TMPDIR/trojan" ]; then
-  echo -e "${RED}Trojan binary not found in archive. Aborting.${RESET}"
+  TMPDIR=$(mktemp -d)
+  tar -xJf "$tmpfile" -C "$TMPDIR"
+  if [ ! -f "$TMPDIR/trojan" ]; then
+    echo -e "${RED}Trojan binary not found in archive. Aborting.${RESET}"
+    rm -rf "$TMPDIR" "$tmpfile"
+    exit 1
+  fi
+  cp "$TMPDIR/trojan" /usr/local/bin/trojan
+  chmod +x /usr/local/bin/trojan
+  TROJAN_BIN="/usr/local/bin/trojan"
   rm -rf "$TMPDIR" "$tmpfile"
-  exit 1
+  echo -e "${GREEN}Trojan binary installed to $TROJAN_BIN${RESET}"
+else
+  echo -e "${GREEN}Using trojan binary at: $TROJAN_BIN${RESET}"
 fi
-cp "$TMPDIR/trojan" "$TROJAN_BIN"
-chmod +x "$TROJAN_BIN"
-rm -rf "$TMPDIR" "$tmpfile"
 
 # Generate self-signed cert (with IP SAN)
 IP=$(curl -s --max-time 10 ifconfig.me || true)
 if [ -z "$IP" ]; then
-  # fallback to first public address
   IP=$(hostname -I | awk '{print $1}')
 fi
 if [ -z "$IP" ]; then
@@ -99,7 +122,7 @@ openssl req -new -x509 -days 3650 -nodes \
 chmod 600 "$TROJAN_DIR/server.key"
 chmod 644 "$TROJAN_DIR/server.crt"
 
-# If config doesn't exist, create initial config (ask user for initial password)
+# Create initial config if missing
 if [ ! -f "$CONFIG_FILE" ]; then
   echo
   read -p "Enter initial password for first user: " INIT_PASS
@@ -123,7 +146,7 @@ EOF
   echo -e "${GREEN}Created initial config with one user.${RESET}"
 fi
 
-# Create systemd service (points to /usr/local/etc config)
+# Create systemd service using discovered $TROJAN_BIN
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Trojan Service
@@ -156,7 +179,7 @@ CONFIG_FILE="$TROJAN_DIR/config.json"
 TROJAN_PORT=2443
 
 # Colors
-RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; BOLD="\e[1m"; RESET="\e[0m"
+RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; MAGENTA="\e[35m"; BOLD="\e[1m"; RESET="\e[0m"
 
 # Ensure script re-exec as root with sudo if not root (this will not prompt if sudoers NOPASSWD set)
 if [ "$(id -u)" -ne 0 ]; then
@@ -240,7 +263,7 @@ if p in pw:
 else:
     print("notfound")
 PY
-  systemctl restart trojan
+  systemctl.restart trojan || systemctl restart trojan.service || true
   echo -e "${RED}Removed (if existed):${RESET} ${REMPASS}"
   read -p "Press Enter to return..."
 }
@@ -301,7 +324,7 @@ EOF
 
 chmod +x "$MENU_PATH"
 
-# Add sudoers NOPASSWD entry for current login user to run trojan-menu
+# Add sudoers NOPASSWD entry for the current login user to run trojan-menu
 CURRENT_USER=$(logname 2>/dev/null || echo root)
 SUDOERS_FILE="/etc/sudoers.d/trojan-menu-nopasswd"
 echo "$CURRENT_USER ALL=(ALL) NOPASSWD: $MENU_PATH" > "$SUDOERS_FILE"
