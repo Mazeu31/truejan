@@ -1,224 +1,253 @@
 #!/bin/bash
 set -euo pipefail
 
+# ---------------- CONFIG ----------------
+TROJAN_PORT=2443
+TROJAN_BIN_CANDIDATES=("/usr/bin/trojan" "/usr/local/bin/trojan" "/bin/trojan")
+TROJAN_BIN=""
+TROJAN_DIR="/usr/local/etc/trojan"
+CONFIG_FILE="$TROJAN_DIR/config.json"
+SERVICE_FILE="/etc/systemd/system/trojan.service"
+MENU_PATH="/usr/local/bin/trojan-menu"
 PANEL_DIR="/var/www/html"
 ADMIN_DIR="$PANEL_DIR/admin"
 SERVERS_FILE="$ADMIN_DIR/servers.json"
+API_FILE="$ADMIN_DIR/api.php"
+CREDS_FILE="$ADMIN_DIR/admin_credentials.json"
 
-# Remove existing panel
-rm -rf "$ADMIN_DIR" "$PANEL_DIR/index.php"
-mkdir -p "$ADMIN_DIR"
+# ---------------- COLORS ----------------
+GREEN="\e[32m"; YELLOW="\e[33m"; RED="\e[31m"; CYAN="\e[36m"; BOLD="\e[1m"; RESET="\e[0m"
 
-# Initialize servers JSON
-touch "$SERVERS_FILE"
-echo '{}' > "$SERVERS_FILE"
+# ---------------- ROOT CHECK ----------------
+[ "$(id -u)" -ne 0 ] && echo -e "${RED}Please run as root${RESET}" && exit 1
 
-# ---------------- Admin Panel ----------------
-cat > "$ADMIN_DIR/index.php" <<'EOF'
-<?php
-session_start();
-$creds_file='admin_credentials.json';
-if(!file_exists($creds_file)){ file_put_contents($creds_file,json_encode(["user"=>"admin","pass"=>"admin123"])); }
-$creds=json_decode(file_get_contents($creds_file),true);
+echo -e "${CYAN}${BOLD}=== Trojan + Panel Installer ===${RESET}"
 
-if(isset($_POST['login'])){
-    if($_POST['username']==$creds['user'] && $_POST['password']==$creds['pass']){
-        $_SESSION['admin']=true;
-    } else { $error="Invalid credentials"; }
+# ---------------- REMOVE OLD TROJAN ----------------
+if command -v trojan >/dev/null 2>&1 || systemctl list-units --full -all | grep -q "trojan.service"; then
+    echo -e "${YELLOW}Removing old Trojan...${RESET}"
+    systemctl stop trojan || true
+    systemctl disable trojan || true
+    rm -f /etc/systemd/system/trojan.service
+    rm -rf "$TROJAN_DIR" /usr/local/bin/trojan /usr/local/bin/trojan-menu
+    systemctl daemon-reload
+    echo -e "${GREEN}Old Trojan removed${RESET}"
+fi
+
+# ---------------- INSTALL DEPENDENCIES ----------------
+apt update -y
+apt install -y wget curl xz-utils tar ca-certificates openssl python3 python3-pip ufw qrencode sudo sshpass || true
+mkdir -p "$TROJAN_DIR" "$ADMIN_DIR"
+chmod 755 "$TROJAN_DIR" "$ADMIN_DIR"
+
+# ---------------- INSTALL TROJAN ----------------
+if apt-get -qq install -y trojan >/dev/null 2>&1; then
+    echo -e "${GREEN}Trojan installed via apt${RESET}"
+fi
+
+# Locate binary
+for candidate in "${TROJAN_BIN_CANDIDATES[@]}"; do [ -x "$candidate" ] && TROJAN_BIN="$candidate" && break; done
+[ -z "$TROJAN_BIN" ] && TROJAN_BIN=$(command -v trojan || true)
+
+if [ -z "$TROJAN_BIN" ]; then
+    echo -e "${YELLOW}Downloading Trojan binary...${RESET}"
+    tmpfile="/tmp/trojan.tar.xz"; rm -f "$tmpfile"
+    LATEST_URL=$(curl -s https://api.github.com/repos/trojan-gfw/trojan/releases/latest | grep browser_download_url | grep linux-amd64 | cut -d '"' -f4)
+    curl -fsSL "$LATEST_URL" -o "$tmpfile"
+    TMPDIR=$(mktemp -d)
+    tar -xJf "$tmpfile" -C "$TMPDIR"
+    cp "$TMPDIR/trojan" /usr/local/bin/trojan
+    chmod +x /usr/local/bin/trojan
+    TROJAN_BIN="/usr/local/bin/trojan"
+    rm -rf "$TMPDIR" "$tmpfile"
+    echo -e "${GREEN}Trojan binary installed at $TROJAN_BIN${RESET}"
+fi
+
+# ---------------- TROJAN CONFIG ----------------
+IP=$(curl -s --max-time 10 ifconfig.me || hostname -I | awk '{print $1}')
+[ -z "$IP" ] && echo -e "${RED}Cannot detect server IP${RESET}" && exit 1
+
+[ ! -f "$CONFIG_FILE" ] && {
+    read -p "Enter password for first user: " INIT_PASS
+    read -p "Expire in how many days? " INIT_DAYS
+    EXP_DATE=$(date -d "+$INIT_DAYS days" "+%Y-%m-%d")
+    cat > "$CONFIG_FILE" <<EOF
+{
+  "run_type": "server",
+  "local_addr": "0.0.0.0",
+  "local_port": $TROJAN_PORT,
+  "remote_addr": "127.0.0.1",
+  "remote_port": 80,
+  "users": [{"password":"$INIT_PASS","expire":"$EXP_DATE"}],
+  "log_level":1,
+  "ssl":{"cert":"$TROJAN_DIR/server.crt","key":"$TROJAN_DIR/server.key","verify":false},
+  "udp":true
 }
-if(isset($_GET['logout'])){ session_destroy(); header("Location:index.php"); exit;}
-if(!isset($_SESSION['admin'])){
-?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Admin Login</title>
-<script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-100 flex items-center justify-center h-screen">
-<form method="post" class="bg-white p-8 rounded-xl shadow-lg w-full max-w-md">
-<h2 class="text-3xl font-bold mb-6 text-center">Admin Login</h2>
-<?php if(isset($error)){echo "<p class='text-red-500 mb-4'>$error</p>";} ?>
-<input type="text" name="username" placeholder="Username" class="w-full p-3 mb-4 border rounded-lg" required>
-<input type="password" name="password" placeholder="Password" class="w-full p-3 mb-6 border rounded-lg" required>
-<button type="submit" name="login" class="w-full bg-blue-600 hover:bg-blue-700 text-white p-3 rounded-lg font-semibold">Login</button>
-</form>
-</body></html>
-<?php exit;} ?>
+EOF
+fi
 
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trojan Admin Panel</title>
-<script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-100 min-h-screen p-4">
-<div class="container mx-auto">
-<header class="flex justify-between items-center mb-6">
-<h1 class="text-3xl font-bold">Trojan Admin Panel</h1>
-<a href="?logout=1" class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg">Logout</a>
-</header>
+# Self-signed cert
+openssl req -new -x509 -days 3650 -nodes -out "$TROJAN_DIR/server.crt" -keyout "$TROJAN_DIR/server.key" -subj "/CN=trojan-server" -addext "subjectAltName=IP:${IP}"
+chmod 600 "$TROJAN_DIR/server.key" && chmod 644 "$TROJAN_DIR/server.crt"
 
-<section class="mb-6">
-<h2 class="text-xl font-semibold mb-2">Servers</h2>
-<div id="servers" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
-<button onclick="openAddServerModal()" class="mt-4 bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg">Add Server</button>
-</section>
-</div>
+# ---------------- SYSTEMD SERVICE ----------------
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Trojan Service
+After=network.target
 
-<!-- Add Server Modal -->
-<div id="addServerModal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
-  <div class="bg-white p-6 rounded-xl shadow-lg w-full max-w-md">
-    <h2 class="text-2xl font-bold mb-4">Add New Server</h2>
-    <form id="addServerForm">
-      <input type="text" id="serverName" placeholder="Server Name" class="w-full p-3 mb-2 border rounded-lg" required>
-      <input type="text" id="serverIP" placeholder="Server IP" class="w-full p-3 mb-2 border rounded-lg" required>
-      <input type="number" id="serverPort" placeholder="Port" class="w-full p-3 mb-2 border rounded-lg" required>
-      <input type="number" id="expireDays" placeholder="Default Expire Days" class="w-full p-3 mb-2 border rounded-lg" required>
-      <input type="text" id="sshUser" placeholder="SSH User" class="w-full p-3 mb-2 border rounded-lg" required>
-      <input type="password" id="sshPass" placeholder="SSH Password" class="w-full p-3 mb-4 border rounded-lg" required>
-      <div class="flex justify-end gap-2">
-        <button type="button" onclick="closeAddServerModal()" class="bg-gray-400 hover:bg-gray-500 text-white px-4 py-2 rounded-lg">Cancel</button>
-        <button type="submit" class="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg">Add</button>
-      </div>
-    </form>
-  </div>
-</div>
+[Service]
+Type=simple
+User=root
+ExecStart=$TROJAN_BIN -c $CONFIG_FILE
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=65536
+ProtectSystem=full
+NoNewPrivileges=true
 
-<!-- Add/Edit User Modal -->
-<div id="userModal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
-  <div class="bg-white p-6 rounded-xl shadow-lg w-full max-w-md">
-    <h2 id="userModalTitle" class="text-2xl font-bold mb-4">Add User</h2>
-    <form id="userForm">
-      <input type="text" id="username" placeholder="Username" class="w-full p-3 mb-2 border rounded-lg" required>
-      <input type="text" id="password" placeholder="Password" class="w-full p-3 mb-2 border rounded-lg" required>
-      <input type="number" id="expire" placeholder="Expire in days" class="w-full p-3 mb-4 border rounded-lg" required>
-      <div class="flex justify-end gap-2">
-        <button type="button" onclick="closeUserModal()" class="bg-gray-400 hover:bg-gray-500 text-white px-4 py-2 rounded-lg">Cancel</button>
-        <button type="submit" class="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg">Save</button>
-      </div>
-    </form>
-  </div>
-</div>
-
-<script>
-const serversFile='servers.json';
-let currentEditServer='';
-let editUserIndex=-1;
-
-// Load servers
-function loadServers(){
-    fetch(serversFile).then(r=>r.json()).then(data=>{
-        const div=document.getElementById('servers'); div.innerHTML='';
-        for(const s in data){
-            const d=document.createElement('div');
-            d.className='bg-white p-4 rounded-xl shadow flex flex-col justify-between';
-            let usersList='';
-            if(data[s].users){ for(const [i,u] of data[s].users.entries()){ 
-                usersList+=`${u.username} (${u.expire}) <button onclick="editUser('${s}',${i})" class="bg-yellow-500 px-1 rounded text-white ml-1">Edit</button><br>`; 
-            } }
-            d.innerHTML=`<div><b>${s}</b><br>IP: ${data[s].ip}<br>Port: ${data[s].port}<br>Users:<br>${usersList}</div>
-            <div class="mt-2 flex gap-2">
-                <button onclick="editServer('${s}')" class="bg-yellow-500 hover:bg-yellow-600 text-white px-2 py-1 rounded-lg">Edit Server</button>
-                <button onclick="addUser('${s}')" class="bg-blue-500 hover:bg-blue-600 text-white px-2 py-1 rounded-lg">Add User</button>
-            </div>`;
-            div.appendChild(d);
-        }
-    });
-}
-
-// Modal functions
-function openAddServerModal(){document.getElementById('addServerModal').classList.remove('hidden');document.getElementById('addServerModal').classList.add('flex');}
-function closeAddServerModal(){document.getElementById('addServerModal').classList.add('hidden');document.getElementById('addServerModal').classList.remove('flex');}
-function openUserModal(){document.getElementById('userModal').classList.remove('hidden');document.getElementById('userModal').classList.add('flex');}
-function closeUserModal(){document.getElementById('userModal').classList.add('hidden');document.getElementById('userModal').classList.remove('flex');}
-
-// Add Server Submit
-document.getElementById('addServerForm').addEventListener('submit', function(e){
-    e.preventDefault();
-    const name=document.getElementById('serverName').value;
-    const ip=document.getElementById('serverIP').value;
-    const port=document.getElementById('serverPort').value;
-    const expireDays=document.getElementById('expireDays').value;
-    const user=document.getElementById('sshUser').value;
-    const pass=document.getElementById('sshPass').value;
-
-    fetch(serversFile).then(r=>r.json()).then(data=>{
-        data[name]={ip,port,expireDays,user,pass,users:[]};
-        fetch(serversFile,{
-            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)
-        }).then(()=>{ loadServers(); closeAddServerModal(); alert('Server added successfully'); });
-    });
-});
-
-// Add User
-function addUser(server){
-    currentEditServer=server; editUserIndex=-1;
-    document.getElementById('userModalTitle').innerText="Add User for "+server;
-    document.getElementById('username').value='';
-    document.getElementById('password').value='';
-    document.getElementById('expire').value='';
-    openUserModal();
-}
-
-// Edit User
-function editUser(server,index){
-    currentEditServer=server; editUserIndex=index;
-    fetch(serversFile).then(r=>r.json()).then(data=>{
-        const u=data[server].users[index];
-        document.getElementById('userModalTitle').innerText="Edit User for "+server;
-        document.getElementById('username').value=u.username;
-        document.getElementById('password').value=u.password;
-        document.getElementById('expire').value=u.expire;
-        openUserModal();
-    });
-}
-
-// User form submit
-document.getElementById('userForm').addEventListener('submit',function(e){
-    e.preventDefault();
-    const username=document.getElementById('username').value;
-    const password=document.getElementById('password').value;
-    const expire=document.getElementById('expire').value;
-
-    fetch(serversFile).then(r=>r.json()).then(data=>{
-        if(!data[currentEditServer].users) data[currentEditServer].users=[];
-        if(editUserIndex>=0){ // edit
-            data[currentEditServer].users[editUserIndex]={username,password,expire};
-        } else { // add
-            data[currentEditServer].users.push({username,password,expire});
-        }
-        fetch(serversFile,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
-        .then(()=>{ loadServers(); closeUserModal(); alert('User saved successfully'); });
-    });
-});
-
-// Dummy edit server (can add modal later)
-function editServer(server){ alert("Edit server: "+server+" (modal can be added)"); }
-
-loadServers();
-</script>
+[Install]
+WantedBy=multi-user.target
 EOF
 
-# ---------------- Public Panel ----------------
+systemctl daemon-reload
+systemctl enable --now trojan || systemctl start trojan
+ufw allow "$TROJAN_PORT"/tcp || true
+
+# ---------------- TROJAN-MENU ----------------
+cat > "$MENU_PATH" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+TROJAN_DIR="/usr/local/etc/trojan"
+CONFIG_FILE="$TROJAN_DIR/config.json"
+TROJAN_PORT=2443
+
+add_user(){
+    read -p "Enter new password: " P
+    read -p "Expire in how many days: " D
+    python3 - <<PY
+import json,datetime
+cfg="$CONFIG_FILE"
+p="$P"; days=int("$D")
+exp=(datetime.date.today()+datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+with open(cfg,'r') as f: j=json.load(f)
+if "users" not in j: j["users"]=[]
+j["users"].append({"password":p,"expire":exp})
+with open(cfg,'w') as f: json.dump(j,f,indent=2)
+PY
+    systemctl restart trojan
+    echo "User added: $P, expires in $D days"
+}
+
+while true; do
+echo "1) Add user"; echo "2) Exit"
+read -p "Select: " o
+case $o in
+1) add_user ;;
+2) exit 0 ;;
+*) echo "Invalid" ;;
+esac
+done
+EOF
+chmod +x "$MENU_PATH"
+echo "root ALL=(ALL) NOPASSWD: $MENU_PATH" > /etc/sudoers.d/trojan-menu-nopasswd
+chmod 0440 /etc/sudoers.d/trojan-menu-nopasswd
+
+# ---------------- REMOVE OLD PANEL ----------------
+rm -rf "$ADMIN_DIR" "$PANEL_DIR/index.php"
+mkdir -p "$ADMIN_DIR"
+[ ! -f "$SERVERS_FILE" ] && echo '{}' > "$SERVERS_FILE"
+[ ! -f "$CREDS_FILE" ] && echo '{"user":"admin","pass":"admin123"}' > "$CREDS_FILE"
+
+# ---------------- API ----------------
+cat > "$API_FILE" <<'EOF'
+<?php
+$servers_file='servers.json';
+$creds_file='admin_credentials.json';
+$data=json_decode(file_get_contents($servers_file),true);
+$post=json_decode(file_get_contents("php://input"),true);
+$action=$_GET['action']??($post['action']??'list');
+header('Content-Type: application/json');
+
+if($action=='list'){ echo json_encode($data); exit; }
+
+if($action=='addServer'){
+  $data[$post['name']]=['ip'=>$post['ip'],'port'=>$post['port'],'expireDays'=>$post['expireDays'],'sshUser'=>$post['user'],'sshPass'=>$post['pass'],'users'=>[]];
+  file_put_contents($servers_file,json_encode($data,JSON_PRETTY_PRINT));
+  echo json_encode(['status'=>'ok']); exit;
+}
+
+if($action=='editServer'){
+  $s=$post['oldName'];
+  if(isset($data[$s])){
+    $data[$post['newName']]=$data[$s]; unset($data[$s]);
+    $data[$post['newName']]['ip']=$post['ip'];
+    $data[$post['newName']]['port']=$post['port'];
+    file_put_contents($servers_file,json_encode($data,JSON_PRETTY_PRINT));
+  }
+  echo json_encode(['status'=>'ok']); exit;
+}
+
+if($action=='addUser'){
+  $s=$post['server']; $index=$post['index']??-1;
+  if(!isset($data[$s]['users'])) $data[$s]['users']=[];
+  $u=['username'=>$post['username'],'password'=>$post['password'],'expire'=>$post['expire']];
+  if($index>=0) $data[$s]['users'][$index]=$u; else $data[$s]['users'][]=$u;
+  file_put_contents($servers_file,json_encode($data,JSON_PRETTY_PRINT));
+  echo json_encode(['status'=>'ok']); exit;
+}
+
+if($action=='createUserPublic'){
+  $server=$post['server'];
+  $username='user'.rand(1000,9999);
+  $password=substr(bin2hex(random_bytes(4)),0,8);
+  if(isset($data[$server])){
+    $ssh_user=$data[$server]['sshUser']; $ssh_pass=$data[$server]['sshPass']; $ssh_ip=$data[$server]['ip']; $expire=$data[$server]['expireDays'];
+    $cmd="sshpass -p '$ssh_pass' ssh -o StrictHostKeyChecking=no $ssh_user@$ssh_ip \"echo -e '$password\n$expire' | trojan-menu add_user\"";
+    exec($cmd,$out,$ret);
+    if($ret===0){
+      $data[$server]['users'][]=['username'=>$username,'password'=>$password,'expire'=>$expire];
+      file_put_contents($servers_file,json_encode($data,JSON_PRETTY_PRINT));
+      echo json_encode(['status'=>'ok','username'=>$username,'password'=>$password,'expire'=>$expire,'ip'=>$ssh_ip,'port'=>$data[$server]['port']]);
+      exit;
+    } else { echo json_encode(['status'=>'error','msg'=>'Failed to create user']); exit; }
+  } else { echo json_encode(['status'=>'error','msg'=>'Server not found']); exit; }
+}
+EOF
+
+# ---------------- ADMIN PANEL ----------------
+cat > "$ADMIN_DIR/index.php" <<'EOF'
+<?php
+$creds=json_decode(file_get_contents('admin_credentials.json'),true);
+session_start();
+if(isset($_POST['login'])){
+  if($_POST['user']==$creds['user'] && $_POST['pass']==$creds['pass']){
+    $_SESSION['admin']=true;
+  } else { $err="Invalid credentials"; }
+}
+if(!isset($_SESSION['admin'])){
+?>
+<form method="POST" class="max-w-sm mx-auto mt-20 p-6 bg-white shadow rounded">
+<h2 class="text-2xl font-bold mb-4">Admin Login</h2>
+<?php if(isset($err)) echo "<p class='text-red-500'>$err</p>"; ?>
+<input class="border p-2 w-full mb-2" name="user" placeholder="Username">
+<input class="border p-2 w-full mb-2" type="password" name="pass" placeholder="Password">
+<button class="bg-blue-500 hover:bg-blue-600 text-white p-2 rounded w-full" name="login">Login</button>
+</form>
+<?php exit; } ?>
+<h1 class="text-3xl font-bold mb-4">Trojan Admin Panel</h1>
+<p>Manage servers & users</p>
+EOF
+
+# ---------------- PUBLIC PANEL ----------------
 cat > "$PANEL_DIR/index.php" <<'EOF'
 <?php
-$serversFile='admin/servers.json';
-$servers=json_decode(file_get_contents($serversFile),true);
+$servers=json_decode(file_get_contents('admin/servers.json'),true);
 ?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trojan Public Panel</title>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Trojan Public Panel</title>
 <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-100 p-4 min-h-screen">
-<div class="container mx-auto">
-<h1 class="text-3xl font-bold mb-6">Trojan Public Panel</h1>
+</head><body class="bg-gray-100 p-4 min-h-screen">
+<div class="container mx-auto"><h1 class="text-3xl font-bold mb-6">Trojan Public Panel</h1>
 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
 <?php foreach($servers as $sname=>$s){ ?>
 <div class="bg-white p-4 rounded-xl shadow flex flex-col justify-between">
@@ -226,22 +255,24 @@ $servers=json_decode(file_get_contents($serversFile),true);
 <button onclick="createAccount('<?php echo $sname;?>')" class="mt-2 bg-blue-500 hover:bg-blue-600 text-white px-2 py-1 rounded-lg">Create Account</button>
 </div>
 <?php } ?>
-</div>
-</div>
-
+</div></div>
 <script>
 function createAccount(server){
-    let username='user'+Math.floor(Math.random()*10000);
-    let password=Math.random().toString(36).slice(-8);
-    alert("Created on "+server+"\nUsername:"+username+"\nPassword:"+password+"\nExpiration depends on server default");
-    // Here you can implement AJAX POST to server via PHP to update servers.json if needed
+    fetch('admin/api.php',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'createUserPublic',server})})
+    .then(r=>r.json()).then(res=>{
+        if(res.status=='ok') alert(`Created!\nUsername:${res.username}\nPassword:${res.password}\nIP:${res.ip}\nPort:${res.port}\nTrojan Link: trojan://${res.password}@${res.ip}:${res.port}`);
+        else alert('Error: '+res.msg);
+    });
 }
 </script>
-</body>
-</html>
+</body></html>
 EOF
 
-echo "=== Trojan Admin/Public Panel Installed ==="
-echo "Admin panel: http://<YOUR-IP>/admin/"
-echo "Public panel: http://<YOUR-IP>/"
-echo "Default login: admin / admin123"
+# ---------------- PERMISSIONS ----------------
+chown -R www-data:www-data "$PANEL_DIR"
+chmod -R 755 "$PANEL_DIR"
+
+echo -e "${GREEN}✅ Installation Complete!${RESET}"
+echo -e "Admin Panel: http://<YOUR-IP>/admin/"
+echo -e "Public Panel: http://<YOUR-IP>/"
+echo -e "Default login: admin / admin123"
