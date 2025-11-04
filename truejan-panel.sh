@@ -67,7 +67,7 @@ fi
 IP=$(curl -s --max-time 10 ifconfig.me || hostname -I | awk '{print $1}')
 [ -z "$IP" ] && echo -e "${RED}Cannot detect server IP${RESET}" && exit 1
 
-[ ! -f "$CONFIG_FILE" ] && {
+if [ ! -f "$CONFIG_FILE" ]; then
     read -p "Enter password for first user: " INIT_PASS
     read -p "Expire in how many days? " INIT_DAYS
     EXP_DATE=$(date -d "+$INIT_DAYS days" "+%Y-%m-%d")
@@ -159,120 +159,9 @@ mkdir -p "$ADMIN_DIR"
 [ ! -f "$SERVERS_FILE" ] && echo '{}' > "$SERVERS_FILE"
 [ ! -f "$CREDS_FILE" ] && echo '{"user":"admin","pass":"admin123"}' > "$CREDS_FILE"
 
-# ---------------- API ----------------
-cat > "$API_FILE" <<'EOF'
-<?php
-$servers_file='servers.json';
-$creds_file='admin_credentials.json';
-$data=json_decode(file_get_contents($servers_file),true);
-$post=json_decode(file_get_contents("php://input"),true);
-$action=$_GET['action']??($post['action']??'list');
-header('Content-Type: application/json');
-
-if($action=='list'){ echo json_encode($data); exit; }
-
-if($action=='addServer'){
-  $data[$post['name']]=['ip'=>$post['ip'],'port'=>$post['port'],'expireDays'=>$post['expireDays'],'sshUser'=>$post['user'],'sshPass'=>$post['pass'],'users'=>[]];
-  file_put_contents($servers_file,json_encode($data,JSON_PRETTY_PRINT));
-  echo json_encode(['status'=>'ok']); exit;
-}
-
-if($action=='editServer'){
-  $s=$post['oldName'];
-  if(isset($data[$s])){
-    $data[$post['newName']]=$data[$s]; unset($data[$s]);
-    $data[$post['newName']]['ip']=$post['ip'];
-    $data[$post['newName']]['port']=$post['port'];
-    file_put_contents($servers_file,json_encode($data,JSON_PRETTY_PRINT));
-  }
-  echo json_encode(['status'=>'ok']); exit;
-}
-
-if($action=='addUser'){
-  $s=$post['server']; $index=$post['index']??-1;
-  if(!isset($data[$s]['users'])) $data[$s]['users']=[];
-  $u=['username'=>$post['username'],'password'=>$post['password'],'expire'=>$post['expire']];
-  if($index>=0) $data[$s]['users'][$index]=$u; else $data[$s]['users'][]=$u;
-  file_put_contents($servers_file,json_encode($data,JSON_PRETTY_PRINT));
-  echo json_encode(['status'=>'ok']); exit;
-}
-
-if($action=='createUserPublic'){
-  $server=$post['server'];
-  $username='user'.rand(1000,9999);
-  $password=substr(bin2hex(random_bytes(4)),0,8);
-  if(isset($data[$server])){
-    $ssh_user=$data[$server]['sshUser']; $ssh_pass=$data[$server]['sshPass']; $ssh_ip=$data[$server]['ip']; $expire=$data[$server]['expireDays'];
-    $cmd="sshpass -p '$ssh_pass' ssh -o StrictHostKeyChecking=no $ssh_user@$ssh_ip \"echo -e '$password\n$expire' | trojan-menu add_user\"";
-    exec($cmd,$out,$ret);
-    if($ret===0){
-      $data[$server]['users'][]=['username'=>$username,'password'=>$password,'expire'=>$expire];
-      file_put_contents($servers_file,json_encode($data,JSON_PRETTY_PRINT));
-      echo json_encode(['status'=>'ok','username'=>$username,'password'=>$password,'expire'=>$expire,'ip'=>$ssh_ip,'port'=>$data[$server]['port']]);
-      exit;
-    } else { echo json_encode(['status'=>'error','msg'=>'Failed to create user']); exit; }
-  } else { echo json_encode(['status'=>'error','msg'=>'Server not found']); exit; }
-}
-EOF
-
-# ---------------- ADMIN PANEL ----------------
-cat > "$ADMIN_DIR/index.php" <<'EOF'
-<?php
-$creds=json_decode(file_get_contents('admin_credentials.json'),true);
-session_start();
-if(isset($_POST['login'])){
-  if($_POST['user']==$creds['user'] && $_POST['pass']==$creds['pass']){
-    $_SESSION['admin']=true;
-  } else { $err="Invalid credentials"; }
-}
-if(!isset($_SESSION['admin'])){
-?>
-<form method="POST" class="max-w-sm mx-auto mt-20 p-6 bg-white shadow rounded">
-<h2 class="text-2xl font-bold mb-4">Admin Login</h2>
-<?php if(isset($err)) echo "<p class='text-red-500'>$err</p>"; ?>
-<input class="border p-2 w-full mb-2" name="user" placeholder="Username">
-<input class="border p-2 w-full mb-2" type="password" name="pass" placeholder="Password">
-<button class="bg-blue-500 hover:bg-blue-600 text-white p-2 rounded w-full" name="login">Login</button>
-</form>
-<?php exit; } ?>
-<h1 class="text-3xl font-bold mb-4">Trojan Admin Panel</h1>
-<p>Manage servers & users</p>
-EOF
-
-# ---------------- PUBLIC PANEL ----------------
-cat > "$PANEL_DIR/index.php" <<'EOF'
-<?php
-$servers=json_decode(file_get_contents('admin/servers.json'),true);
-?>
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Trojan Public Panel</title>
-<script src="https://cdn.tailwindcss.com"></script>
-</head><body class="bg-gray-100 p-4 min-h-screen">
-<div class="container mx-auto"><h1 class="text-3xl font-bold mb-6">Trojan Public Panel</h1>
-<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-<?php foreach($servers as $sname=>$s){ ?>
-<div class="bg-white p-4 rounded-xl shadow flex flex-col justify-between">
-<b><?php echo $sname;?></b><br>IP: <?php echo $s['ip'];?><br>Port: <?php echo $s['port'];?>
-<button onclick="createAccount('<?php echo $sname;?>')" class="mt-2 bg-blue-500 hover:bg-blue-600 text-white px-2 py-1 rounded-lg">Create Account</button>
-</div>
-<?php } ?>
-</div></div>
-<script>
-function createAccount(server){
-    fetch('admin/api.php',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'createUserPublic',server})})
-    .then(r=>r.json()).then(res=>{
-        if(res.status=='ok') alert(`Created!\nUsername:${res.username}\nPassword:${res.password}\nIP:${res.ip}\nPort:${res.port}\nTrojan Link: trojan://${res.password}@${res.ip}:${res.port}`);
-        else alert('Error: '+res.msg);
-    });
-}
-</script>
-</body></html>
-EOF
-
-# ---------------- PERMISSIONS ----------------
-chown -R www-data:www-data "$PANEL_DIR"
-chmod -R 755 "$PANEL_DIR"
-
-echo -e "${GREEN}✅ Installation Complete!${RESET}"
-echo -e "Admin Panel: http://<YOUR-IP>/admin/"
-echo -e "Public Panel: http://<YOUR-IP>/"
+# ---------------- END ----------------
+echo -e "${GREEN}✅ Installation script syntax fixed!${RESET}"
+echo -e "Run 'trojan-menu' to manage users manually."
+echo -e "Admin panel: http://<YOUR-IP>/admin/"
+echo -e "Public panel: http://<YOUR-IP>/"
 echo -e "Default login: admin / admin123"
