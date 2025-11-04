@@ -1,13 +1,12 @@
 #!/bin/bash
 # =========================================================
 # Trojan (trojan-gfw) Manager - No Domain version
-# Compatible with Debian/Ubuntu
+# By: ChatGPT Edition
 # =========================================================
 
-# --- Auto elevate to root ---
+# --- Auto elevate silently if needed ---
 if [ "$EUID" -ne 0 ]; then
-  sudo "$0" "$@"
-  exit $?
+  exec sudo "$0" "$@"
 fi
 
 # --- Colors ---
@@ -26,9 +25,6 @@ SERVICE_FILE="/etc/systemd/system/trojan.service"
 TROJAN_BIN="/usr/local/bin/trojan"
 TROJAN_PORT=443
 
-# =========================================================
-# Functions
-# =========================================================
 function banner() {
     clear
     echo -e "${CYAN}==============================================${RESET}"
@@ -37,11 +33,38 @@ function banner() {
     echo
 }
 
+function show_connection_info() {
+    local password="$1"
+    local ip=$(curl -s ifconfig.me)
+    local link="trojan://${password}@${ip}:${TROJAN_PORT}?security=tls&type=tcp&allowInsecure=1"
+
+    echo
+    echo -e "${BOLD}${GREEN}✅ Trojan User Created Successfully!${RESET}"
+    echo -e "${YELLOW}------------------------------------------${RESET}"
+    echo -e "${BOLD}Server IP:${RESET} ${CYAN}${ip}${RESET}"
+    echo -e "${BOLD}Port:${RESET} ${CYAN}${TROJAN_PORT}${RESET}"
+    echo -e "${BOLD}Password:${RESET} ${CYAN}${password}${RESET}"
+    echo -e "${YELLOW}------------------------------------------${RESET}"
+    echo -e "${BOLD}Trojan Link:${RESET}"
+    echo -e "${MAGENTA}${link}${RESET}"
+    echo
+
+    # Optional QR Code if qrencode installed
+    if command -v qrencode >/dev/null 2>&1; then
+        echo -e "${YELLOW}QR Code for Passwall/Clash:${RESET}"
+        qrencode -t ANSIUTF8 "${link}"
+    else
+        echo -e "${RED}Note:${RESET} Install qrencode to generate QR codes:"
+        echo "    sudo apt install -y qrencode"
+    fi
+    echo
+}
+
 function install_trojan() {
     banner
     echo -e "${BOLD}${GREEN}Installing Trojan...${RESET}"
     apt update -y
-    apt install -y wget curl openssl xz-utils unzip ufw
+    apt install -y wget curl openssl xz-utils unzip ufw qrencode
 
     echo -e "${YELLOW}Downloading Trojan binary...${RESET}"
     LATEST_URL=$(curl -s https://api.github.com/repos/trojan-gfw/trojan/releases/latest | grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4)
@@ -99,19 +122,7 @@ EOF
     systemctl enable --now trojan
     ufw allow ${TROJAN_PORT}/tcp || true
 
-    echo
-    echo -e "${GREEN}Trojan installed successfully!${RESET}"
-    echo -e "${YELLOW}------------------------------------------${RESET}"
-    echo -e "${BOLD}Server IP:${RESET} $(curl -s ifconfig.me)"
-    echo -e "${BOLD}Port:${RESET} $TROJAN_PORT"
-    echo -e "${BOLD}Password:${RESET} $INIT_PASS"
-    echo -e "${YELLOW}------------------------------------------${RESET}"
-    echo -e "Use these settings in Passwall (Trojan):"
-    echo -e "  ${BOLD}Address:${RESET} Your server IP"
-    echo -e "  ${BOLD}Port:${RESET} 443"
-    echo -e "  ${BOLD}Password:${RESET} $INIT_PASS"
-    echo -e "  ${BOLD}Skip TLS Verify:${RESET} ENABLED"
-    echo
+    show_connection_info "$INIT_PASS"
     read -p "Press Enter to return to menu..."
 }
 
@@ -128,7 +139,7 @@ function add_user() {
     read -p "Enter new password to add: " NEWPASS
     sed -i "s/\(\"password\": \[\)/\1\"$NEWPASS\", /" $CONFIG_FILE
     systemctl restart trojan
-    echo -e "${GREEN}User added successfully:${RESET} $NEWPASS"
+    show_connection_info "$NEWPASS"
     read -p "Press Enter to return..."
 }
 
