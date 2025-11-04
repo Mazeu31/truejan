@@ -7,13 +7,13 @@ SERVERS_FILE="$ADMIN_DIR/servers.json"
 
 # Remove existing panel
 rm -rf "$ADMIN_DIR" "$PANEL_DIR/index.php"
-
-# Create directories
 mkdir -p "$ADMIN_DIR"
+
+# Initialize servers JSON
 touch "$SERVERS_FILE"
 echo '{}' > "$SERVERS_FILE"
 
-# ------------------- Admin Panel -------------------
+# ---------------- Admin Panel ----------------
 cat > "$ADMIN_DIR/index.php" <<'EOF'
 <?php
 session_start();
@@ -50,7 +50,8 @@ if(!isset($_SESSION['admin'])){
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Trojan Admin Panel</title>
 <script src="https://cdn.tailwindcss.com"></script>
 </head>
@@ -87,8 +88,26 @@ if(!isset($_SESSION['admin'])){
   </div>
 </div>
 
+<!-- Add/Edit User Modal -->
+<div id="userModal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
+  <div class="bg-white p-6 rounded-xl shadow-lg w-full max-w-md">
+    <h2 id="userModalTitle" class="text-2xl font-bold mb-4">Add User</h2>
+    <form id="userForm">
+      <input type="text" id="username" placeholder="Username" class="w-full p-3 mb-2 border rounded-lg" required>
+      <input type="text" id="password" placeholder="Password" class="w-full p-3 mb-2 border rounded-lg" required>
+      <input type="number" id="expire" placeholder="Expire in days" class="w-full p-3 mb-4 border rounded-lg" required>
+      <div class="flex justify-end gap-2">
+        <button type="button" onclick="closeUserModal()" class="bg-gray-400 hover:bg-gray-500 text-white px-4 py-2 rounded-lg">Cancel</button>
+        <button type="submit" class="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script>
 const serversFile='servers.json';
+let currentEditServer='';
+let editUserIndex=-1;
 
 // Load servers
 function loadServers(){
@@ -98,10 +117,12 @@ function loadServers(){
             const d=document.createElement('div');
             d.className='bg-white p-4 rounded-xl shadow flex flex-col justify-between';
             let usersList='';
-            if(data[s].users){ for(const u of data[s].users){ usersList+=`${u.username} (${u.expire})<br>`; } }
+            if(data[s].users){ for(const [i,u] of data[s].users.entries()){ 
+                usersList+=`${u.username} (${u.expire}) <button onclick="editUser('${s}',${i})" class="bg-yellow-500 px-1 rounded text-white ml-1">Edit</button><br>`; 
+            } }
             d.innerHTML=`<div><b>${s}</b><br>IP: ${data[s].ip}<br>Port: ${data[s].port}<br>Users:<br>${usersList}</div>
             <div class="mt-2 flex gap-2">
-                <button onclick="editServer('${s}')" class="bg-yellow-500 hover:bg-yellow-600 text-white px-2 py-1 rounded-lg">Edit</button>
+                <button onclick="editServer('${s}')" class="bg-yellow-500 hover:bg-yellow-600 text-white px-2 py-1 rounded-lg">Edit Server</button>
                 <button onclick="addUser('${s}')" class="bg-blue-500 hover:bg-blue-600 text-white px-2 py-1 rounded-lg">Add User</button>
             </div>`;
             div.appendChild(d);
@@ -112,6 +133,8 @@ function loadServers(){
 // Modal functions
 function openAddServerModal(){document.getElementById('addServerModal').classList.remove('hidden');document.getElementById('addServerModal').classList.add('flex');}
 function closeAddServerModal(){document.getElementById('addServerModal').classList.add('hidden');document.getElementById('addServerModal').classList.remove('flex');}
+function openUserModal(){document.getElementById('userModal').classList.remove('hidden');document.getElementById('userModal').classList.add('flex');}
+function closeUserModal(){document.getElementById('userModal').classList.add('hidden');document.getElementById('userModal').classList.remove('flex');}
 
 // Add Server Submit
 document.getElementById('addServerForm').addEventListener('submit', function(e){
@@ -131,15 +154,56 @@ document.getElementById('addServerForm').addEventListener('submit', function(e){
     });
 });
 
-// Dummy add user function (can be replaced with modal later)
-function addUser(server){ alert('Add user on '+server); }
-function editServer(server){ alert('Edit server '+server); }
+// Add User
+function addUser(server){
+    currentEditServer=server; editUserIndex=-1;
+    document.getElementById('userModalTitle').innerText="Add User for "+server;
+    document.getElementById('username').value='';
+    document.getElementById('password').value='';
+    document.getElementById('expire').value='';
+    openUserModal();
+}
+
+// Edit User
+function editUser(server,index){
+    currentEditServer=server; editUserIndex=index;
+    fetch(serversFile).then(r=>r.json()).then(data=>{
+        const u=data[server].users[index];
+        document.getElementById('userModalTitle').innerText="Edit User for "+server;
+        document.getElementById('username').value=u.username;
+        document.getElementById('password').value=u.password;
+        document.getElementById('expire').value=u.expire;
+        openUserModal();
+    });
+}
+
+// User form submit
+document.getElementById('userForm').addEventListener('submit',function(e){
+    e.preventDefault();
+    const username=document.getElementById('username').value;
+    const password=document.getElementById('password').value;
+    const expire=document.getElementById('expire').value;
+
+    fetch(serversFile).then(r=>r.json()).then(data=>{
+        if(!data[currentEditServer].users) data[currentEditServer].users=[];
+        if(editUserIndex>=0){ // edit
+            data[currentEditServer].users[editUserIndex]={username,password,expire};
+        } else { // add
+            data[currentEditServer].users.push({username,password,expire});
+        }
+        fetch(serversFile,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+        .then(()=>{ loadServers(); closeUserModal(); alert('User saved successfully'); });
+    });
+});
+
+// Dummy edit server (can add modal later)
+function editServer(server){ alert("Edit server: "+server+" (modal can be added)"); }
 
 loadServers();
 </script>
 EOF
 
-# ------------------- Public Panel -------------------
+# ---------------- Public Panel ----------------
 cat > "$PANEL_DIR/index.php" <<'EOF'
 <?php
 $serversFile='admin/servers.json';
@@ -152,21 +216,32 @@ $servers=json_decode(file_get_contents($serversFile),true);
 <title>Trojan Public Panel</title>
 <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-gray-100 min-h-screen p-4">
+<body class="bg-gray-100 p-4 min-h-screen">
 <div class="container mx-auto">
 <h1 class="text-3xl font-bold mb-6">Trojan Public Panel</h1>
 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-<?php foreach($servers as $name=>$s): ?>
+<?php foreach($servers as $sname=>$s){ ?>
 <div class="bg-white p-4 rounded-xl shadow flex flex-col justify-between">
-<h2 class="text-xl font-semibold mb-2"><?= htmlspecialchars($name) ?></h2>
-<p>IP: <?= htmlspecialchars($s['ip']) ?><br>Port: <?= htmlspecialchars($s['port']) ?></p>
-<button onclick="alert('Create account for <?= htmlspecialchars($name) ?>')" class="mt-2 bg-blue-500 hover:bg-blue-600 text-white px-2 py-1 rounded-lg">Create Account</button>
+<b><?php echo $sname;?></b><br>IP: <?php echo $s['ip'];?><br>Port: <?php echo $s['port'];?>
+<button onclick="createAccount('<?php echo $sname;?>')" class="mt-2 bg-blue-500 hover:bg-blue-600 text-white px-2 py-1 rounded-lg">Create Account</button>
 </div>
-<?php endforeach; ?>
+<?php } ?>
 </div>
 </div>
+
+<script>
+function createAccount(server){
+    let username='user'+Math.floor(Math.random()*10000);
+    let password=Math.random().toString(36).slice(-8);
+    alert("Created on "+server+"\nUsername:"+username+"\nPassword:"+password+"\nExpiration depends on server default");
+    // Here you can implement AJAX POST to server via PHP to update servers.json if needed
+}
+</script>
 </body>
 </html>
 EOF
 
-echo "✅ Trojan Panel installed/updated. Admin panel: /admin, Public panel: /index.php"
+echo "=== Trojan Admin/Public Panel Installed ==="
+echo "Admin panel: http://<YOUR-IP>/admin/"
+echo "Public panel: http://<YOUR-IP>/"
+echo "Default login: admin / admin123"
