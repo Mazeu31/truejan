@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ========================
-# Trojan Debian Auto Installer (Panel-ready, Expiration Support)
+# Trojan Debian Auto Installer (Idempotent, Expiration Support)
 # ========================
 
 TROJAN_PORT=2443
@@ -10,16 +10,18 @@ TROJAN_BIN_CANDIDATES=("/usr/bin/trojan" "/usr/local/bin/trojan" "/bin/trojan")
 TROJAN_BIN=""
 TROJAN_DIR="/usr/local/etc/trojan"
 CONFIG_FILE="$TROJAN_DIR/config.json"
-PANEL_USERS="$TROJAN_DIR/panel_users.json"
 SERVICE_FILE="/etc/systemd/system/trojan.service"
 MENU_PATH="/usr/local/bin/trojan-menu"
 
 # Colors
 GREEN="\e[32m"; YELLOW="\e[33m"; RED="\e[31m"; CYAN="\e[36m"; BOLD="\e[1m"; RESET="\e[0m"
 
-[ "$(id -u)" -ne 0 ] && echo -e "${RED}Please run as root.${RESET}" && exit 1
+if [ "$(id -u)" -ne 0 ]; then
+  echo -e "${RED}Please run as root (sudo).${RESET}"
+  exit 1
+fi
 
-echo -e "${CYAN}${BOLD}=== Trojan Debian Installer (Panel-ready) ===${RESET}"
+echo -e "${CYAN}${BOLD}=== Trojan Debian Installer (Idempotent) ===${RESET}"
 
 # -------------------------
 # Remove existing Trojan if found
@@ -29,45 +31,60 @@ if command -v trojan >/dev/null 2>&1 || systemctl list-units --full -all | grep 
     systemctl stop trojan || true
     systemctl disable trojan || true
     rm -f /etc/systemd/system/trojan.service
-    rm -rf "$TROJAN_DIR" /usr/local/bin/trojan /usr/local/bin/trojan-menu
+    rm -rf /usr/local/etc/trojan /usr/local/bin/trojan /usr/local/bin/trojan-menu
     systemctl daemon-reload
-    echo -e "${GREEN}Old Trojan removed.${RESET}"
+    echo -e "${GREEN}Old Trojan installation removed.${RESET}"
 fi
 
 # Install base packages
 echo -e "${YELLOW}Installing base packages...${RESET}"
 apt update -y
-apt install -y wget curl xz-utils tar ca-certificates openssl python3 python3-pip ufw qrencode sudo jq sshpass || true
+apt install -y wget curl xz-utils tar ca-certificates openssl python3 python3-pip ufw qrencode sudo || true
 mkdir -p "$TROJAN_DIR"
 chmod 755 "$TROJAN_DIR"
 
-# Install trojan binary
+# Install trojan via apt
+echo -e "${YELLOW}Attempting to install 'trojan' via apt...${RESET}"
+if apt-get -qq install -y trojan >/dev/null 2>&1; then
+  echo -e "${GREEN}Installed 'trojan' package via apt.${RESET}"
+fi
+
+# Locate binary
 for candidate in "${TROJAN_BIN_CANDIDATES[@]}"; do
   [ -x "$candidate" ] && TROJAN_BIN="$candidate" && break
 done
 [ -z "$TROJAN_BIN" ] && TROJAN_BIN=$(command -v trojan || true)
 
+# Fallback to GitHub release if binary not found
 if [ -z "$TROJAN_BIN" ]; then
   echo -e "${YELLOW}Binary not found, downloading latest release...${RESET}"
   tmpfile="/tmp/trojan.tar.xz"
-  LATEST_URL=$(curl -s https://api.github.com/repos/trojan-gfw/trojan/releases/latest \
-    | grep browser_download_url | grep linux-amd64 | cut -d '"' -f4)
-  curl -fsSL "$LATEST_URL" -o "$tmpfile"
+  attempt=0; max_attempts=4; rm -f "$tmpfile"
+  while [ $attempt -lt $max_attempts ]; do
+    attempt=$((attempt+1))
+    LATEST_URL=$(curl -s https://api.github.com/repos/trojan-gfw/trojan/releases/latest \
+      | grep browser_download_url | grep linux-amd64 | cut -d '"' -f4 || true)
+    [ -z "$LATEST_URL" ] && sleep 2 && continue
+    curl -fsSL "$LATEST_URL" -o "$tmpfile" && break
+    rm -f "$tmpfile"
+    sleep 2
+  done
+  [ ! -f "$tmpfile" ] && echo -e "${RED}Failed to download trojan.${RESET}" && exit 1
   TMPDIR=$(mktemp -d)
   tar -xJf "$tmpfile" -C "$TMPDIR"
   cp "$TMPDIR/trojan" /usr/local/bin/trojan
   chmod +x /usr/local/bin/trojan
   TROJAN_BIN="/usr/local/bin/trojan"
   rm -rf "$TMPDIR" "$tmpfile"
-  echo -e "${GREEN}Trojan binary installed.${RESET}"
+  echo -e "${GREEN}Trojan binary installed to $TROJAN_BIN${RESET}"
 else
   echo -e "${GREEN}Using trojan binary at $TROJAN_BIN${RESET}"
 fi
 
-# Generate self-signed certificate
+# Generate self-signed cert
 IP=$(curl -s --max-time 10 ifconfig.me || hostname -I | awk '{print $1}')
 [ -z "$IP" ] && echo -e "${RED}Cannot determine server IP.${RESET}" && exit 1
-echo -e "${YELLOW}Generating self-signed certificate...${RESET}"
+echo -e "${YELLOW}Generating self-signed certificate for IP $IP ...${RESET}"
 openssl req -new -x509 -days 3650 -nodes \
   -out "$TROJAN_DIR/server.crt" \
   -keyout "$TROJAN_DIR/server.key" \
@@ -75,11 +92,9 @@ openssl req -new -x509 -days 3650 -nodes \
 chmod 600 "$TROJAN_DIR/server.key"
 chmod 644 "$TROJAN_DIR/server.crt"
 
-# Create initial config & panel users file
-mkdir -p "$(dirname "$PANEL_USERS")"
-[ ! -f "$PANEL_USERS" ] && echo "{}" > "$PANEL_USERS"
-
+# Create initial config with users list
 if [ ! -f "$CONFIG_FILE" ]; then
+  echo
   read -p "Enter password for first user: " INIT_PASS
   read -p "Expire in how many days? " INIT_DAYS
   EXP_DATE=$(date -d "+$INIT_DAYS days" "+%Y-%m-%d")
@@ -90,7 +105,12 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "local_port": $TROJAN_PORT,
   "remote_addr": "127.0.0.1",
   "remote_port": 80,
-  "password": ["$INIT_PASS"],
+  "users": [
+    {
+      "password": "$INIT_PASS",
+      "expire": "$EXP_DATE"
+    }
+  ],
   "log_level": 1,
   "ssl": {
     "cert": "$TROJAN_DIR/server.crt",
@@ -100,11 +120,10 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "udp": true
 }
 EOF
-  jq --arg p "$INIT_PASS" --arg e "$EXP_DATE" '. + {($p): {password:$p, expire:$e}}' "$PANEL_USERS" > "${PANEL_USERS}.tmp" && mv "${PANEL_USERS}.tmp" "$PANEL_USERS"
-  echo -e "${GREEN}Initial user created.${RESET}"
+  echo -e "${GREEN}Created initial config with one user.${RESET}"
 fi
 
-# Create systemd service
+# Create systemd service (runs as root)
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Trojan Service
@@ -126,80 +145,127 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now trojan || systemctl start trojan || true
+
+# Open firewall port
 ufw allow "$TROJAN_PORT"/tcp || true
 
-# Trojan-menu (with panel_users.json update)
+# Create updated trojan-menu (password + expiration)
 cat > "$MENU_PATH" <<'EOF'
 #!/bin/bash
 set -euo pipefail
-CONFIG_FILE="/usr/local/etc/trojan/config.json"
-PANEL_USERS="/usr/local/etc/trojan/panel_users.json"
+TROJAN_DIR="/usr/local/etc/trojan"
+CONFIG_FILE="$TROJAN_DIR/config.json"
 TROJAN_PORT=2443
+RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; BOLD="\e[1m"; RESET="\e[0m"
 
 [ "$(id -u)" -ne 0 ] && exec sudo "$0" "$@"
+
+banner() { clear; echo -e "${CYAN}=== TROJAN SERVER MANAGER ===${RESET}"; echo; }
 
 add_user() {
   read -p "Enter new password: " NEWPASS
   read -p "Expire in how many days? " DAYS
-  EXP_DATE=$(date -d "+$DAYS days" "+%Y-%m-%d")
-  # Update config.json
   python3 - <<PY
-import json
+import json,datetime
 cfg="$CONFIG_FILE"
 p="$NEWPASS"
-exp="$EXP_DATE"
-with open(cfg,'r') as f: j=json.load(f)
-if "password" not in j: j["password"]=[]
-if p not in j["password"]: j["password"].append(p)
+days=int("$DAYS")
+exp_date=(datetime.date.today() + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+try:
+    with open(cfg,'r') as f: j=json.load(f)
+except:
+    j={}
+if "users" not in j: j["users"]=[]
+j["users"].append({"password": p, "expire": exp_date})
 with open(cfg,'w') as f: json.dump(j,f,indent=2)
 PY
-  # Update panel_users.json
-  python3 - <<PY
-import json
-cfg="$PANEL_USERS"
-p="$NEWPASS"
-exp="$EXP_DATE"
-try: u=json.load(open(cfg))
-except: u={}
-u[p]={"password":p,"expire":exp}
-with open(cfg,'w') as f: json.dump(u,f,indent=2)
-PY
   systemctl restart trojan
-  echo -e "✅ User added: $NEWPASS (expires $EXP_DATE)"
+  echo -e "${GREEN}✅ User added: ${CYAN}${NEWPASS}${RESET}, expires in ${DAYS} days"
+  read -p "Press Enter to return..."
 }
 
 list_users() {
   python3 - <<PY
 import json,datetime
-cfg="$PANEL_USERS"
+cfg="$CONFIG_FILE"
 today=datetime.date.today()
-try: users=json.load(open(cfg))
-except: users={}
-for u,v in users.items():
-    exp=datetime.datetime.strptime(v["expire"], "%Y-%m-%d").date()
-    days_left=(exp-today).days
-    status="expired" if days_left<0 else "active"
-    print(f"{u} | {v['expire']} | {days_left if days_left>=0 else 0} days left | {status}")
+try:
+    with open(cfg,'r') as f: j=json.load(f)
+    users=j.get("users",[])
+except:
+    users=[]
+if not users:
+    print("No users found.")
+else:
+    for u in users:
+        exp=datetime.datetime.strptime(u["expire"], "%Y-%m-%d").date()
+        days_left=(exp-today).days
+        status="expired" if days_left<0 else "active"
+        print(f"{u['password']} | {u['expire']} | {days_left if days_left>=0 else 0} days left | {status}")
 PY
+  read -p "Press Enter to return..."
+}
+
+remove_user() {
+  read -p "Enter password to remove: " REMPASS
+  python3 - <<PY
+import json
+cfg="$CONFIG_FILE";p="$REMPASS"
+with open(cfg,'r') as f: j=json.load(f)
+users=j.get("users",[])
+users=[u for u in users if u["password"]!=p]
+j["users"]=users
+with open(cfg,'w') as f: import json; json.dump(j,f,indent=2)
+PY
+  systemctl restart trojan
+  echo -e "${RED}Removed (if existed): ${REMPASS}${RESET}"
+  read -p "Press Enter to return..."
 }
 
 show_info() {
   echo -e "Server IP: $(curl -s ifconfig.me || hostname -I | awk '{print $1}')"
   echo -e "Port: $TROJAN_PORT"
+  echo -e "Users:"
   list_users
 }
 
+restart_trojan() {
+  systemctl restart trojan
+  echo -e "${GREEN}Trojan restarted.${RESET}"
+  sleep 1
+}
+
+uninstall() {
+  read -p "Uninstall trojan? (yes/NO): " ans
+  [ "$ans" = "yes" ] || return
+  systemctl stop trojan || true
+  systemctl disable trojan || true
+  rm -f /etc/systemd/system/trojan.service
+  rm -rf /usr/local/etc/trojan /usr/local/bin/trojan /usr/local/bin/trojan-menu
+  systemctl daemon-reload
+  echo -e "${RED}Trojan removed.${RESET}"
+  exit 0
+}
+
 while true; do
-  echo "1) Add user"
-  echo "2) List users"
-  echo "3) Show info"
-  echo "0) Exit"
-  read -p "Option: " opt
+  banner
+  echo -e "${GREEN}1)${RESET} Add user"
+  echo -e "${GREEN}2)${RESET} Remove user"
+  echo -e "${GREEN}3)${RESET} List users"
+  echo -e "${GREEN}4)${RESET} Show server info"
+  echo -e "${GREEN}5)${RESET} Restart trojan"
+  echo -e "${RED}6)${RESET} Uninstall trojan"
+  echo -e "${CYAN}0)${RESET} Exit"
+  read -p "Select option: " opt
   case "$opt" in
     1) add_user ;;
-    2) list_users ;;
-    3) show_info ;;
+    2) remove_user ;;
+    3) list_users ;;
+    4) show_info ;;
+    5) restart_trojan ;;
+    6) uninstall ;;
     0) exit 0 ;;
+    *) echo -e "${RED}Invalid option${RESET}"; sleep 1 ;;
   esac
 done
 EOF
@@ -207,4 +273,7 @@ EOF
 chmod +x "$MENU_PATH"
 CURRENT_USER=$(logname 2>/dev/null || echo root)
 echo "$CURRENT_USER ALL=(ALL) NOPASSWD: $MENU_PATH" > /etc/sudoers.d/trojan-menu-nopasswd
-chmod 0440 /etc/sudoers.d
+chmod 0440 /etc/sudoers.d/trojan-menu-nopasswd
+
+echo -e "${GREEN}=== Installation complete ===${RESET}"
+echo -e "Run '${BOLD}trojan-menu${RESET}' to manage users with expiration."
