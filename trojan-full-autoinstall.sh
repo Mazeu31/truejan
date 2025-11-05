@@ -1,69 +1,66 @@
 #!/bin/bash
-# trojan-autoinstall-safe.sh
-# Safe Trojan autoscript (No domain, self-signed)
-# Installs trojan binary, creates /etc/trojan, systemd service, and trojan-menu
-# Run once as root: sudo bash trojan-autoinstall-safe.sh
+# =========================================================
+# Trojan-GFW Auto Installer (No Domain)
+# With Menu + Auto Command Shortcut
+# By ChatGPT Edition
+# =========================================================
 
-set -euo pipefail
+set -e
 
-# --- CONFIG ---
+# Colors
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+CYAN="\e[36m"
+BOLD="\e[1m"
+RESET="\e[0m"
+
+echo -e "${CYAN}=============================================${RESET}"
+echo -e "${BOLD}${YELLOW}     TROJAN AUTO INSTALLER (No Domain)       ${RESET}"
+echo -e "${CYAN}=============================================${RESET}"
+echo
+
+# Check root
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}Please run as root (sudo su)${RESET}"
+  exit 1
+fi
+
+# Install dependencies
+echo -e "${YELLOW}Installing dependencies...${RESET}"
+apt update -y
+apt install -y wget curl openssl xz-utils unzip ufw qrencode sudo
+
+# Set vars
+TROJAN_DIR="/etc/trojan"
+CONFIG_FILE="$TROJAN_DIR/config.json"
+SERVICE_FILE="/etc/systemd/system/trojan.service"
+TROJAN_BIN="/usr/local/bin/trojan"
 TROJAN_PORT=443
-TROJAN_DIR=/etc/trojan
-TROJAN_BIN=/usr/local/bin/trojan
-MENU_PATH=/usr/local/bin/trojan-menu
-SERVICE_PATH=/etc/systemd/system/trojan.service
+IP=$(curl -s ifconfig.me)
 
-# --- helper ---
-echog() { echo -e "\e[1;32m$*\e[0m"; }
-echow() { echo -e "\e[1;33m$*\e[0m"; }
-echor() { echo -e "\e[1;31m$*\e[0m"; }
+# Install Trojan binary
+echo -e "${YELLOW}Installing Trojan binary...${RESET}"
+LATEST_URL=$(curl -s https://api.github.com/repos/trojan-gfw/trojan/releases/latest | grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4)
+wget -O /tmp/trojan.tar.xz $LATEST_URL
+tar -xJf /tmp/trojan.tar.xz -C /tmp
+cp /tmp/trojan/trojan $TROJAN_BIN
+chmod +x $TROJAN_BIN
+mkdir -p $TROJAN_DIR
 
-if [ "$(id -u)" -ne 0 ]; then
-  echor "Please run as root (sudo)."
-  exit 1
-fi
-
-echog "1) Installing packages (apt)..."
-apt-get update -y
-apt-get install -y curl wget openssl xz-utils unzip ufw qrencode sudo ca-certificates gnupg
-
-echog "2) Downloading latest Trojan linux-amd64 release from GitHub..."
-# Query GitHub API and pick linux-amd64 tar.xz asset (works without auth for public repos)
-LATEST_URL=$(curl -sSf "https://api.github.com/repos/trojan-gfw/trojan/releases/latest" \
-  | awk -F\" '/browser_download_url/ && /linux-amd64/ {print $4; exit}')
-if [ -z "$LATEST_URL" ]; then
-  echor "Could not find linux-amd64 release URL. Aborting."
-  exit 1
-fi
-
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
-
-wget -qO "$TMPDIR/trojan.tar.xz" "$LATEST_URL"
-tar -xJf "$TMPDIR/trojan.tar.xz" -C "$TMPDIR"
-if [ ! -f "$TMPDIR/trojan" ]; then
-  echor "Trojan binary not found in archive. Aborting."
-  exit 1
-fi
-cp "$TMPDIR/trojan" "$TROJAN_BIN"
-chmod +x "$TROJAN_BIN"
-
-echog "3) Creating trojan dir and self-signed certificate..."
-mkdir -p "$TROJAN_DIR"
-SERVER_IP=$(curl -s ifconfig.me || echo "127.0.0.1")
+# Generate cert
+echo -e "${YELLOW}Generating self-signed certificate...${RESET}"
 openssl req -new -x509 -days 3650 -nodes \
-  -out "$TROJAN_DIR/server.crt" -keyout "$TROJAN_DIR/server.key" \
-  -subj "/CN=trojan-server" -addext "subjectAltName=IP:${SERVER_IP}"
+  -out $TROJAN_DIR/server.crt \
+  -keyout $TROJAN_DIR/server.key \
+  -subj "/CN=trojan-server" -addext "subjectAltName=IP:${IP}"
 
-# --- ask initial password ---
-read -rp "Enter initial password for the first client: " INIT_PASS
-if [ -z "$INIT_PASS" ]; then
-  echor "Password cannot be empty. Aborting."
-  exit 1
-fi
+# First user
+echo
+read -p "Enter initial password for first user: " INIT_PASS
 
-echog "4) Writing config to $TROJAN_DIR/config.json..."
-cat > "$TROJAN_DIR/config.json" <<EOF
+# Config file
+cat > $CONFIG_FILE <<EOF
 {
   "run_type": "server",
   "local_addr": "0.0.0.0",
@@ -80,11 +77,9 @@ cat > "$TROJAN_DIR/config.json" <<EOF
   "udp": true
 }
 EOF
-chmod 640 "$TROJAN_DIR/config.json"
-chown root:root "$TROJAN_DIR/config.json"
 
-echog "5) Creating systemd service..."
-cat > "$SERVICE_PATH" <<EOF
+# Service file
+cat > $SERVICE_FILE <<EOF
 [Unit]
 Description=Trojan Service
 After=network.target
@@ -92,7 +87,7 @@ After=network.target
 [Service]
 Type=simple
 User=nobody
-ExecStart=$TROJAN_BIN -c $TROJAN_DIR/config.json
+ExecStart=$TROJAN_BIN -c $CONFIG_FILE
 Restart=on-failure
 LimitNOFILE=65536
 
@@ -102,94 +97,134 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now trojan
-
-echog "6) Open firewall port $TROJAN_PORT (ufw)"
 ufw allow ${TROJAN_PORT}/tcp || true
 
-echog "7) Installing trojan-menu command to $MENU_PATH ..."
-cat > "$MENU_PATH" <<'MENU_EOF'
+# Create /usr/local/bin/trojan-menu
+cat > /usr/local/bin/trojan-menu <<'MENU'
 #!/bin/bash
-# trojan-menu - simple manager (must be run as normal user)
-if [ "$(id -u)" -ne 0 ]; then
+# Trojan Menu
+
+if [ "$EUID" -ne 0 ]; then
   exec sudo "$0" "$@"
 fi
-TROJAN_DIR=/etc/trojan
-CONFIG_FILE=$TROJAN_DIR/config.json
+
+RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; BOLD="\e[1m"; RESET="\e[0m"
+TROJAN_DIR="/etc/trojan"
+CONFIG_FILE="$TROJAN_DIR/config.json"
 TROJAN_PORT=443
-COLOR_G="\e[1;32m"; COLOR_Y="\e[1;33m"; COLOR_R="\e[1;31m"; COLOR_C="\e[1;36m"; RESET="\e[0m"
 
-banner() {
-  clear
-  echo -e "${COLOR_C}================ Trojan Manager ===============${RESET}"
+function banner() {
+    clear
+    echo -e "${CYAN}==============================================${RESET}"
+    echo -e "${BOLD}${YELLOW}        TROJAN SERVER MANAGER (No Domain)     ${RESET}"
+    echo -e "${CYAN}==============================================${RESET}"
+    echo
 }
 
-list_users() {
-  grep -oP '"\K[^"]+(?=")' "$CONFIG_FILE" | tail -n +2
+function show_connection_info() {
+    local password="$1"
+    local ip=$(curl -s ifconfig.me)
+    local link="trojan://${password}@${ip}:${TROJAN_PORT}?security=tls&type=tcp&allowInsecure=1"
+    echo
+    echo -e "${BOLD}${GREEN}✅ User Added:${RESET} ${CYAN}${password}${RESET}"
+    echo -e "${YELLOW}------------------------------------------${RESET}"
+    echo -e "Server IP : ${CYAN}${ip}${RESET}"
+    echo -e "Port      : ${CYAN}${TROJAN_PORT}${RESET}"
+    echo -e "Password  : ${CYAN}${password}${RESET}"
+    echo -e "${YELLOW}------------------------------------------${RESET}"
+    echo -e "${BOLD}Trojan Link:${RESET}"
+    echo -e "${MAGENTA}${link}${RESET}"
+    echo
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t ANSIUTF8 "${link}"
+    fi
 }
 
-show_info() {
-  echo "Server IP : $(curl -s ifconfig.me || echo '127.0.0.1')"
-  echo "Port      : $TROJAN_PORT"
-  echo "Users:"
-  list_users
+function add_user() {
+    banner
+    read -p "Enter new password to add: " NEWPASS
+    sed -i "s/\(\"password\": \[\)/\1\"$NEWPASS\", /" $CONFIG_FILE
+    systemctl restart trojan
+    show_connection_info "$NEWPASS"
+    read -p "Press Enter to return..."
 }
 
-add_user_flow() {
-  read -p "Enter new password: " NP
-  if [ -z "$NP" ]; then echo "empty"; return; fi
-  sed -i "s/\(\"password\": \[\)/\1\"$NP\", /" "$CONFIG_FILE"
-  systemctl restart trojan
-  IP=$(curl -s ifconfig.me || echo 127.0.0.1)
-  LINK="trojan://${NP}@${IP}:${TROJAN_PORT}?security=tls&type=tcp&allowInsecure=1"
-  echo -e "Added user: $NP"
-  echo -e "Link: $LINK"
-  if command -v qrencode >/dev/null 2>&1; then
-    qrencode -t ANSIUTF8 "$LINK"
-  fi
+function remove_user() {
+    banner
+    read -p "Enter password to remove: " REMPASS
+    sed -i "/\"$REMPASS\"/d" $CONFIG_FILE
+    systemctl restart trojan
+    echo -e "${RED}User removed:${RESET} $REMPASS"
+    read -p "Press Enter to return..."
 }
 
-remove_user_flow() {
-  read -p "Enter password to remove: " RP
-  if [ -z "$RP" ]; then echo "empty"; return; fi
-  sed -i "/\"$RP\"/d" "$CONFIG_FILE"
-  systemctl restart trojan
-  echo "Removed: $RP"
+function list_users() {
+    banner
+    echo -e "${BOLD}${CYAN}Current Trojan Users:${RESET}"
+    grep -oP '"\K[^"]+(?=")' $CONFIG_FILE | tail -n +2
+    echo
+    read -p "Press Enter to return..."
+}
+
+function show_info() {
+    banner
+    echo -e "${BOLD}Server Info:${RESET}"
+    echo -e "IP Address: $(curl -s ifconfig.me)"
+    echo -e "Port: ${TROJAN_PORT}"
+    echo
+    list_users
+}
+
+function restart_trojan() {
+    systemctl restart trojan
+    echo -e "${GREEN}Trojan restarted.${RESET}"
+    sleep 1
+}
+
+function uninstall_trojan() {
+    banner
+    echo -e "${RED}Uninstalling Trojan...${RESET}"
+    systemctl stop trojan
+    systemctl disable trojan
+    rm -rf /etc/trojan /usr/local/bin/trojan /etc/systemd/system/trojan.service
+    systemctl daemon-reload
+    echo -e "${RED}Removed.${RESET}"
+    exit 0
 }
 
 while true; do
-  banner
-  echo "1) Add user"
-  echo "2) Remove user"
-  echo "3) List users"
-  echo "4) Show server info"
-  echo "5) Restart trojan"
-  echo "6) Uninstall trojan"
-  echo "0) Exit"
-  read -rp "Select: " opt
-  case $opt in
-    1) add_user_flow; read -p "Enter to continue...";;
-    2) remove_user_flow; read -p "Enter to continue...";;
-    3) list_users; read -p "Enter to continue...";;
-    4) show_info; read -p "Enter to continue...";;
-    5) systemctl restart trojan; echo "restarted"; read -p "Enter to continue...";;
-    6) echo "Uninstalling..."; systemctl stop trojan; systemctl disable trojan; rm -f /etc/trojan/* /usr/local/bin/trojan /etc/systemd/system/trojan.service; systemctl daemon-reload; echo "done"; exit 0;;
-    0) exit 0;;
-    *) echo "invalid"; sleep 1;;
-  esac
+    banner
+    echo -e "${BOLD}${GREEN}1)${RESET} Add user"
+    echo -e "${BOLD}${GREEN}2)${RESET} Remove user"
+    echo -e "${BOLD}${GREEN}3)${RESET} List users"
+    echo -e "${BOLD}${GREEN}4)${RESET} Show server info"
+    echo -e "${BOLD}${GREEN}5)${RESET} Restart Trojan"
+    echo -e "${BOLD}${RED}6)${RESET} Uninstall Trojan"
+    echo -e "${BOLD}${CYAN}0)${RESET} Exit"
+    echo
+    read -p "Select option: " opt
+    case $opt in
+        1) add_user ;;
+        2) remove_user ;;
+        3) list_users ;;
+        4) show_info ;;
+        5) restart_trojan ;;
+        6) uninstall_trojan ;;
+        0) clear; exit 0 ;;
+        *) echo -e "${RED}Invalid option!${RESET}"; sleep 1 ;;
+    esac
 done
-MENU_EOF
+MENU
 
-chmod +x "$MENU_PATH"
+chmod +x /usr/local/bin/trojan-menu
 
-echog "8) Allow current login user to run trojan-menu without sudo password"
-# get login user (fall back)
-LOGIN_USER=$(logname 2>/dev/null || echo "$SUDO_USER" || echo root)
-echo "$LOGIN_USER ALL=(ALL) NOPASSWD: $MENU_PATH" > /etc/sudoers.d/trojan-menu-nopasswd
-chmod 0440 /etc/sudoers.d/trojan-menu-nopasswd
+# Allow user to run trojan-menu without password
+USERNAME=$(logname)
+echo "$USERNAME ALL=(ALL) NOPASSWD: /usr/local/bin/trojan-menu" > /etc/sudoers.d/trojan-menu-nopasswd
 
-echog "Summary"
-echow " - Server IP: $SERVER_IP"
-echow " - Troj an port: $TROJAN_PORT"
-echow " - First user password: $INIT_PASS"
-echow " - Run 'trojan-menu' as the login user to manage users (no sudo prompt)."
-echog "Done. To test: trojan-menu"
+clear
+echo -e "${GREEN}✅ Trojan installed successfully!${RESET}"
+echo
+echo -e "${YELLOW}You can now type:${RESET} ${BOLD}trojan-menu${RESET}"
+echo -e "No sudo required — manage users and configs easily."
+echo
